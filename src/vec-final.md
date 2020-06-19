@@ -1,72 +1,72 @@
 # The Final Code
 
 ```rust
-#![feature(ptr_internals)]
-#![feature(allocator_api)]
-#![feature(alloc_layout_extra)]
-
-use std::ptr::{Unique, NonNull, self};
+use std::alloc::{self, Layout};
+use std::marker::PhantomData;
 use std::mem;
 use std::ops::{Deref, DerefMut};
-use std::marker::PhantomData;
-use std::alloc::{
-    AllocInit,
-    AllocRef,
-    Global,
-    GlobalAlloc,
-    Layout,
-    ReallocPlacement,
-    handle_alloc_error
-};
+use std::ptr::{self, NonNull};
 
 struct RawVec<T> {
-    ptr: Unique<T>,
+    ptr: NonNull<T>,
     cap: usize,
+    _marker: PhantomData<T>,
 }
+
+unsafe impl<T: Send> Send for RawVec<T> {}
+unsafe impl<T: Sync> Sync for RawVec<T> {}
 
 impl<T> RawVec<T> {
     fn new() -> Self {
         // !0 is usize::MAX. This branch should be stripped at compile time.
         let cap = if mem::size_of::<T>() == 0 { !0 } else { 0 };
 
-        // Unique::dangling() doubles as "unallocated" and "zero-sized allocation"
-        RawVec { ptr: Unique::dangling(), cap: cap }
+        // NonNull::dangling() doubles as "unallocated" and "zero-sized allocation"
+        RawVec {
+            ptr: NonNull::dangling(),
+            cap: cap,
+            _marker: PhantomData,
+        }
     }
 
     fn grow(&mut self) {
-        unsafe {
-            let elem_size = mem::size_of::<T>();
+        // since we set the capacity to usize::MAX when T has size 0,
+        // getting to here necessarily means the Vec is overfull.
+        assert!(mem::size_of::<T>() != 0, "capacity overflow");
 
-            // since we set the capacity to usize::MAX when elem_size is
-            // 0, getting to here necessarily means the Vec is overfull.
-            assert!(elem_size != 0, "capacity overflow");
+        let (new_cap, new_layout) = if self.cap == 0 {
+            (1, Layout::array::<T>(1).unwrap())
+        } else {
+            // This can't overflow because we ensure self.cap <= isize::MAX.
+            let new_cap = 2 * self.cap;
 
-            let (new_cap, ptr) = if self.cap == 0 {
-                let ptr = Global.alloc(Layout::array::<T>(1).unwrap(), AllocInit::Uninitialized);
-                (1, ptr)
-            } else {
-                let new_cap = 2 * self.cap;
-                let c: NonNull<T> = self.ptr.into();
-                let ptr = Global.grow(c.cast(),
-                                      Layout::array::<T>(self.cap).unwrap(),
-                                      Layout::array::<T>(new_cap).unwrap().size(),
-                                      ReallocPlacement::MayMove,
-                                      AllocInit::Uninitialized);
-                (new_cap, ptr)
-            };
+            // Layout::array checks that the number of bytes is <= usize::MAX,
+            // but this is redundant since old_layout.size() <= isize::MAX,
+            // so the `unwrap` should never fail.
+            let new_layout = Layout::array::<T>(new_cap).unwrap();
+            (new_cap, new_layout)
+        };
 
-            // If allocate or reallocate fail, oom
-            if ptr.is_err() {
-                handle_alloc_error(Layout::from_size_align_unchecked(
-                    new_cap * elem_size,
-                    mem::align_of::<T>(),
-                ))
-            }
-            let ptr = ptr.unwrap().ptr;
+        // Ensure that the new allocation doesn't exceed `isize::MAX` bytes.
+        assert!(
+            new_layout.size() <= isize::MAX as usize,
+            "Allocation too large"
+        );
 
-            self.ptr = Unique::new_unchecked(ptr.as_ptr() as *mut _);
-            self.cap = new_cap;
-        }
+        let new_ptr = if self.cap == 0 {
+            unsafe { alloc::alloc(new_layout) }
+        } else {
+            let old_layout = Layout::array::<T>(self.cap).unwrap();
+            let old_ptr = self.ptr.as_ptr() as *mut u8;
+            unsafe { alloc::realloc(old_ptr, old_layout, new_layout.size()) }
+        };
+
+        // If allocation fails, `new_ptr` will be null, in which case we abort.
+        self.ptr = match NonNull::new(new_ptr as *mut T) {
+            Some(p) => p,
+            None => alloc::handle_alloc_error(new_layout),
+        };
+        self.cap = new_cap;
     }
 }
 
@@ -75,9 +75,10 @@ impl<T> Drop for RawVec<T> {
         let elem_size = mem::size_of::<T>();
         if self.cap != 0 && elem_size != 0 {
             unsafe {
-                let c: NonNull<T> = self.ptr.into();
-                Global.dealloc(c.cast(),
-                               Layout::array::<T>(self.cap).unwrap());
+                alloc::dealloc(
+                    self.ptr.as_ptr() as *mut u8,
+                    Layout::array::<T>(self.cap).unwrap(),
+                );
             }
         }
     }
@@ -94,7 +95,10 @@ impl<T> Vec<T> {
     fn cap(&self) -> usize { self.buf.cap }
 
     pub fn new() -> Self {
-        Vec { buf: RawVec::new(), len: 0 }
+        Vec {
+            buf: RawVec::new(),
+            len: 0,
+        }
     }
     pub fn push(&mut self, elem: T) {
         if self.len == self.cap() { self.buf.grow(); }
@@ -103,7 +107,7 @@ impl<T> Vec<T> {
             ptr::write(self.ptr().offset(self.len as isize), elem);
         }
 
-        // Can't fail, we'll OOM first.
+        // Can't overflow, we'll OOM first.
         self.len += 1;
     }
 
@@ -199,10 +203,6 @@ impl<T> DerefMut for Vec<T> {
     }
 }
 
-
-
-
-
 struct RawValIter<T> {
     start: *const T,
     end: *const T,
@@ -266,9 +266,6 @@ impl<T> DoubleEndedIterator for RawValIter<T> {
     }
 }
 
-
-
-
 pub struct IntoIter<T> {
     _buf: RawVec<T>, // we don't actually care about this. Just need it to live.
     iter: RawValIter<T>,
@@ -289,9 +286,6 @@ impl<T> Drop for IntoIter<T> {
         for _ in &mut *self {}
     }
 }
-
-
-
 
 pub struct Drain<'a, T: 'a> {
     vec: PhantomData<&'a mut Vec<T>>,

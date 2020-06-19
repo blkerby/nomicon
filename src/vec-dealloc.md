@@ -16,12 +16,9 @@ impl<T> Drop for Vec<T> {
     fn drop(&mut self) {
         if self.cap != 0 {
             while let Some(_) = self.pop() { }
-
-            let align = mem::align_of::<T>();
-            let elem_size = mem::size_of::<T>();
-            let num_bytes = elem_size * self.cap;
-            unsafe {
-                heap::deallocate(self.ptr.as_ptr() as *mut _, num_bytes, align);
+            let layout = Layout::array::<T>(self.cap).unwrap();
+            unsafe { 
+                alloc::dealloc(self.ptr.as_ptr() as *mut u8, layout); 
             }
         }
     }

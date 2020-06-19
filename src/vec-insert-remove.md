@@ -20,16 +20,14 @@ pub fn insert(&mut self, index: usize, elem: T) {
     if self.cap == self.len { self.grow(); }
 
     unsafe {
-        if index < self.len {
-            // ptr::copy(src, dest, len): "copy from source to dest len elems"
-            ptr::copy(self.ptr.offset(index as isize),
-                      self.ptr.offset(index as isize + 1),
-                      self.len - index);
-        }
-        ptr::write(self.ptr.offset(index as isize), elem);
+        // ptr::copy(src, dest, len): "copy from src to dest len elems"
+        ptr::copy(self.ptr.as_ptr().offset(index as isize),
+                    self.ptr.as_ptr().offset(index as isize + 1),
+                    self.len - index);
+        ptr::write(self.ptr.as_ptr().offset(index as isize), elem);
         self.len += 1;
     }
-}
+}    
 ```
 
 Remove behaves in the opposite manner. We need to shift all the elements from
@@ -41,9 +39,9 @@ pub fn remove(&mut self, index: usize) -> T {
     assert!(index < self.len, "index out of bounds");
     unsafe {
         self.len -= 1;
-        let result = ptr::read(self.ptr.offset(index as isize));
-        ptr::copy(self.ptr.offset(index as isize + 1),
-                  self.ptr.offset(index as isize),
+        let result = ptr::read(self.ptr.as_ptr().offset(index as isize));
+        ptr::copy(self.ptr.as_ptr().offset(index as isize + 1),
+                  self.ptr.as_ptr().offset(index as isize),
                   self.len - index);
         result
     }

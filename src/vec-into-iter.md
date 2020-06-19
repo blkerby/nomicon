@@ -44,10 +44,11 @@ So we're going to use the following struct:
 
 ```rust,ignore
 struct IntoIter<T> {
-    buf: Unique<T>,
+    buf: NonNull<T>,
     cap: usize,
     start: *const T,
     end: *const T,
+    _marker: PhantomData<T>,
 }
 ```
 
@@ -68,13 +69,14 @@ impl<T> Vec<T> {
             IntoIter {
                 buf: ptr,
                 cap: cap,
-                start: *ptr,
+                start: ptr.as_ptr(),
                 end: if cap == 0 {
                     // can't offset off this pointer, it's not allocated!
-                    *ptr
+                    ptr.as_ptr()
                 } else {
-                    ptr.offset(len as isize)
-                }
+                    ptr.as_ptr().offset(len as isize)
+                },
+                _marker: PhantomData,
             }
         }
     }
@@ -134,12 +136,9 @@ impl<T> Drop for IntoIter<T> {
         if self.cap != 0 {
             // drop any remaining elements
             for _ in &mut *self {}
-
-            let align = mem::align_of::<T>();
-            let elem_size = mem::size_of::<T>();
-            let num_bytes = elem_size * self.cap;
-            unsafe {
-                heap::deallocate(self.buf.as_ptr() as *mut _, num_bytes, align);
+            let layout = Layout::array::<T>(self.cap).unwrap();
+            unsafe { 
+                alloc::dealloc(self.buf.as_ptr() as *mut u8, layout); 
             }
         }
     }

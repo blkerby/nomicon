@@ -11,52 +11,64 @@ allocating, growing, and freeing:
 
 ```rust,ignore
 struct RawVec<T> {
-    ptr: Unique<T>,
+    ptr: NonNull<T>,
     cap: usize,
+    _marker: PhantomData<T>,
 }
+
+unsafe impl<T: Send> Send for RawVec<T> {}
+unsafe impl<T: Sync> Sync for RawVec<T> {}
 
 impl<T> RawVec<T> {
     fn new() -> Self {
         assert!(mem::size_of::<T>() != 0, "TODO: implement ZST support");
-        RawVec { ptr: Unique::dangling(), cap: 0 }
-    }
-
-    // unchanged from Vec
-    fn grow(&mut self) {
-        unsafe {
-            let align = mem::align_of::<T>();
-            let elem_size = mem::size_of::<T>();
-
-            let (new_cap, ptr) = if self.cap == 0 {
-                let ptr = heap::allocate(elem_size, align);
-                (1, ptr)
-            } else {
-                let new_cap = 2 * self.cap;
-                let ptr = heap::reallocate(self.ptr.as_ptr() as *mut _,
-                                            self.cap * elem_size,
-                                            new_cap * elem_size,
-                                            align);
-                (new_cap, ptr)
-            };
-
-            // If allocate or reallocate fail, we'll get `null` back
-            if ptr.is_null() { oom() }
-
-            self.ptr = Unique::new(ptr as *mut _);
-            self.cap = new_cap;
+        RawVec {
+            ptr: NonNull::dangling(),
+            cap: 0,
+            _marker: PhantomData,
         }
     }
-}
 
+    fn grow(&mut self) {
+        let (new_cap, new_layout) = if self.cap == 0 {
+            (1, Layout::array::<T>(1).unwrap())
+        } else {
+            // This can't overflow because we ensure self.cap <= isize::MAX.
+            let new_cap = 2 * self.cap;
+
+            // Layout::array checks that the number of bytes is <= usize::MAX,
+            // but this is redundant since old_layout.size() <= isize::MAX,
+            // so the `unwrap` should never fail.
+            let new_layout = Layout::array::<T>(new_cap).unwrap();
+            (new_cap, new_layout)
+        };
+
+        // Ensure that the new allocation doesn't exceed `isize::MAX` bytes.
+        assert!(new_layout.size() <= isize::MAX as usize, "Allocation too large");
+
+        let new_ptr = if self.cap == 0 {
+            unsafe { alloc::alloc(new_layout) }
+        } else {
+            let old_layout = Layout::array::<T>(self.cap).unwrap();
+            let old_ptr = self.ptr.as_ptr() as *mut u8;
+            unsafe { alloc::realloc(old_ptr, old_layout, new_layout.size()) }
+        };
+
+        // If allocation fails, `new_ptr` will be null, in which case we abort.
+        self.ptr = match NonNull::new(new_ptr as *mut T) {
+            Some(p) => p,
+            None => alloc::handle_alloc_error(new_layout),
+        };
+        self.cap = new_cap;
+    }
+}
 
 impl<T> Drop for RawVec<T> {
     fn drop(&mut self) {
         if self.cap != 0 {
-            let align = mem::align_of::<T>();
-            let elem_size = mem::size_of::<T>();
-            let num_bytes = elem_size * self.cap;
+            let layout = Layout::array::<T>(self.cap).unwrap();
             unsafe {
-                heap::deallocate(self.ptr.as_mut() as *mut _, num_bytes, align);
+                alloc::dealloc(self.ptr.as_ptr() as *mut u8, layout);
             }
         }
     }
@@ -66,24 +78,32 @@ impl<T> Drop for RawVec<T> {
 And change Vec as follows:
 
 ```rust,ignore
+
 pub struct Vec<T> {
     buf: RawVec<T>,
     len: usize,
 }
 
 impl<T> Vec<T> {
-    fn ptr(&self) -> *mut T { self.buf.ptr.as_ptr() }
+    fn ptr(&self) -> *mut T {
+        self.buf.ptr.as_ptr()
+    }
 
-    fn cap(&self) -> usize { self.buf.cap }
+    fn cap(&self) -> usize {
+        self.buf.cap
+    }
 
     pub fn new() -> Self {
-        Vec { buf: RawVec::new(), len: 0 }
+        Vec {
+            buf: RawVec::new(),
+            len: 0,
+        }
     }
 
     // push/pop/insert/remove largely unchanged:
-    // * `self.ptr -> self.ptr()`
+    // * `self.ptr.as_ptr() -> self.ptr()`
     // * `self.cap -> self.cap()`
-    // * `self.grow -> self.buf.grow()`
+    // * `self.grow() -> self.buf.grow()`
 }
 
 impl<T> Drop for Vec<T> {
@@ -123,8 +143,8 @@ impl<T> Vec<T> {
             mem::forget(self);
 
             IntoIter {
-                start: *buf.ptr,
-                end: buf.ptr.offset(len as isize),
+                start: buf.ptr.as_ptr(),
+                end: buf.ptr.as_ptr().offset(len as isize),
                 _buf: buf,
             }
         }
